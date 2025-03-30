@@ -1,39 +1,96 @@
 #!/usr/bin/env python3
-from datetime import date, datetime
+import os
+import re
+from pathlib import Path
 from typing import NamedTuple, List
+from datetime import date, datetime
 from subprocess import check_output
-import csv
+from decimal import Decimal, ROUND_HALF_UP
 
-import pdfquery # type: ignore
+import pandas as pd
+
+TABULA_PATH = os.environ['TABULA_JAR_PATH']
 
 class Transaction(NamedTuple):
     received: date
     date: date
+    amount: Decimal
     details: str
-    amount: str
 
+class NullTransaction(NamedTuple):
+    received: None
+    date: None
+    amount: None
+    details: str
 
-_DATE_FORMAT = "%d %b %y"
+def extract_dates(text: str) -> tuple[list[str], int | None, int | None]:
+    """
+    Extract date strings in 'DD Mon YY' format from the text, allowing for optional comma
+    between month and year (e.g., '14 Aug 23' or '14 Aug,23').
+    Only accepts standard English month abbreviations (Jan, Feb, Mar, etc.).
+    Returns a tuple of (date_strings, first_index, last_index).
+    """
+    # Sometimes there is a comma inside the date, ideally this would be handled somewhere more obvious.
+    text_normalised = text.replace(',', ' ').replace('"', '')
+    pattern = r"\b\d{1,2} [A-Za-z]{3} \d{2}\b"
+    potential_matches = [(match.group(), match.start(), match.end() - 1) for match in re.finditer(pattern, text_normalised)]
 
-# TODO unhardcode
-TABULA_PATH = '/L/zzz_syncthing/soft/tabula/tabula-1.0.2.jar'
+    # Valid month abbreviations
+    valid_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-def try_sanitize_amount(amnts):
-    xxx = amnts.split()
-    numberish = []
-    for x in xxx:
-        try:
-            float(x)
-        except ValueError:
-            continue
-        else:
-            numberish.append(x)
-    if len(numberish) == 1:
-        return numberish[0]
+    # Filter matches to ensure month is valid
+    valid_matches = []
+    for match_text, start, end in potential_matches:
+        # Extract just the month portion (should be the second word)
+        parts = match_text.split()
+        if len(parts) >= 2:
+            month_part = parts[1].rstrip(',')
+            if month_part in valid_months or month_part.capitalize() in valid_months:
+                valid_matches.append((match_text, start, end))
+
+    date_strs = [match[0] for match in valid_matches]
+    if valid_matches:
+        first_ix = valid_matches[0][1]  # Start index of first valid date
+        last_ix = valid_matches[-1][2]  # End index of last valid date
     else:
-        return amnts
+        first_ix = last_ix = None
 
-# parses credit card statementc circa june 2018
+    return date_strs, first_ix, last_ix
+
+
+def parse_date(date_str: str) -> datetime:
+    """
+    Parse a date string in 'dd mmm yy' format into a datetime object.
+    Raises ValueError if parsing fails.
+    """
+    try:
+        return datetime.strptime(date_str, "%d %b %y")
+    except ValueError:
+        raise ValueError(f"Unable to parse date: {date_str}")
+
+def parse_transaction_amounts(text: str) -> list[Decimal]:
+    """
+    Parse all transaction amounts from the text, expecting numbers with 2 decimal places,
+    possibly with commas and optional CR/DR suffix, and potentially enclosed in quotes.
+    Returns a list of Decimal amounts.
+    """
+    # Match numbers with 2 decimal places, optional commas, optional CR/DR suffix, and optional quotes
+    pattern = r'"?(\d{1,3}(?:,\d{3})*\.\d{2}(?:CR|DR)?)"?'
+    matches = re.findall(pattern, text)
+
+    if not matches:
+        raise ValueError(f"No amounts with 2 decimal places found in text: {text}")
+
+    # Clean and convert matches to Decimal
+    amounts = []
+    for match in matches:
+        cleaned_amount = match.replace(',', '').rstrip('CR').rstrip('DR')
+        amount = Decimal(cleaned_amount).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        amounts.append(amount)
+
+    return amounts
+
 def yield_credit_infos(fname: str):
     CMD = [
         'java',
@@ -42,75 +99,66 @@ def yield_credit_infos(fname: str):
         '--silent',
         fname,
     ]
-    res = check_output(CMD).decode('utf-8')
+    res = check_output(CMD).decode('windows-1252')
 
-    def try_transaction(line):
-        # line = line.strip('"') # ugh, pdf sucks
-
-        def try_parse_date(ds: str):
-            try:
-                return datetime.strptime(ds, _DATE_FORMAT)
-            except:
-                return None
-
-        datelen = len("11 May 18")
-        # TODO some stupid semicolon...
-        rdates = line[:datelen]
-        ddates = line[datelen + 1: datelen + 1 + datelen]
-        ddates = ddates.replace(',', ' ') # sometimes there is random comma :shrug:
-        rdate = try_parse_date(rdates)
-        ddate = try_parse_date(ddates)
-        if rdate is None and ddate is None:
+    def try_transaction(line: str):
+        """Given a line from a credit card statement, create a Transaction where the line can be parsed as
+        a transaction, returns None otherwise."""
+        re_dates, first_char_ix, last_char_ix = extract_dates(line)
+        if len(re_dates) == 0:
+            yield NullTransaction(
+                received=None,
+                date=None,
+                amount=None,
+                details=line,
+            )
             return
+        assert len(re_dates) == 2, f'Wrong number of dates: {re_dates}'
+        assert first_char_ix == 0, f'Unexpected received date placement on line: {line}'
+        rdate, ddate = [parse_date(dt_str) for dt_str in re_dates]
 
 
-        lline = line[datelen + 1 + datelen:]
-        rest = next(csv.reader([lline]))
-        amount = rest[-1].replace(',', '')
-        details = ' '.join(rest[:-1])
+        remaining_line = line[last_char_ix + 1:]
+        amounts = parse_transaction_amounts(remaining_line)
+        assert len(amounts) == 1, f'Unexpected number of amounts on line {line}'
+        amount = amounts[0]
 
-        # TODO sometimes it's necessary to sanitize amount...
-
-        # TODO parse CR from amount?
-        # import ipdb; ipdb.set_trace() 
-        amount = try_sanitize_amount(amount)
+        # Extract details: remove dates and full amount string (including CR/DR if present), then strip
+        str_amount = str(amount)
+        amount_start, amount_end = remaining_line.find(str_amount), remaining_line.find(str_amount) + len(str_amount)
+        details = remaining_line[:amount_start] + remaining_line[amount_end:]
+        details = details.replace(',', ' ').strip()
 
         yield Transaction(
             received=rdate.date(),
             date=ddate.date(),
-            details=details,
             amount=amount,
+            details=details,
         )
-
 
     for line in res.splitlines():
         for t in try_transaction(line):
             yield t
 
-# ugh. fuck it for now.
-# def yield_debit_infos(fname: str):
-#     pdf = pdfquery.PDFQuery(fname) # , parse_tree_cacher=FileCache("/tmp/")) # TODO more specific path?
-#     pdf.load()
-
-#     tdet = pdf.pq('LTTextBoxHorizontal:contains("see reverse")')[0]
-#     children = list(tdet.getparent().iterchildren())[4:]
-#     [date_col, _, _, _, _, comment_col] ..
-#     pass
-
 def get_credit_infos(fname: str) -> List[Transaction]:
     return list(yield_credit_infos(fname))
 
-# def get_debit_infos(*args, **kwargs):
-#     return list(yield_credit_infos)
 
-def main():
-    import sys
-    pdf_path = sys.argv[1]
-
-    infos = get_credit_infos(pdf_path)
-    for info in infos:
-        print(info)
-
-
-if __name__ == '__main__':
-    main()
+def make_dataframe_from_path(pdf_folder_path: str | Path):
+    res = sorted(Path(pdf_folder_path).glob('*.pdf'))
+    assert len(res) > 0
+    data = []
+    for pdf_path in res:
+        print(pdf_path)
+        sdate = datetime.strptime(pdf_path.name[:10], "%Y-%m-%d").date()
+        transactions = get_credit_infos(pdf_path)
+        for t in transactions:
+            data.append({
+                'statement_fpath': pdf_path,
+                'statement_date': sdate,
+                'received_date': t.received,
+                'transaction_date': t.date,
+                'amount': t.amount,
+                'details': t.details
+            })
+    return pd.DataFrame(data)
