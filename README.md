@@ -1,7 +1,8 @@
-Simple parser for HSBC credit card online PDF statements.
+parse.py is able to read in HSBC credit card statement pdfs into a list of Transaction objects.
 
-Works with HSBC UK as for April 2018.
+Working as of March 2025
 
 # Prerequisites
 
-TODO tabula
+tabula-java
+pandas
