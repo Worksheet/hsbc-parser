@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 import os
-from datetime import date, datetime
-from decimal import Decimal, ROUND_HALF_UP
+import re
 from pathlib import Path
 from typing import NamedTuple, List
+from datetime import date, datetime
 from subprocess import check_output
-import re
+from decimal import Decimal, ROUND_HALF_UP
 
-
+TABULA_PATH = os.environ['TABULA_JAR_PATH']
 
 class Transaction(NamedTuple):
     received: date
     date: date
     amount: Decimal
     details: str
-
-
-_DATE_FORMAT = "%d %b %y"
-TABULA_PATH = os.environ['TABULA_JAR_PATH']
-
 
 def extract_dates(text: str) -> tuple[list[str], int | None, int | None]:
     """
@@ -58,11 +53,11 @@ def extract_dates(text: str) -> tuple[list[str], int | None, int | None]:
 
 def parse_date(date_str: str) -> datetime:
     """
-    Parse a date string in 'DD Mon YY' format into a datetime object.
+    Parse a date string in 'dd mmm yy' format into a datetime object.
     Raises ValueError if parsing fails.
     """
     try:
-        return datetime.strptime(date_str, _DATE_FORMAT)
+        return datetime.strptime(date_str, "%d %b %y")
     except ValueError:
         raise ValueError(f"Unable to parse date: {date_str}")
 
