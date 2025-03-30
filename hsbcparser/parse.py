@@ -7,12 +7,20 @@ from datetime import date, datetime
 from subprocess import check_output
 from decimal import Decimal, ROUND_HALF_UP
 
+import pandas as pd
+
 TABULA_PATH = os.environ['TABULA_JAR_PATH']
 
 class Transaction(NamedTuple):
     received: date
     date: date
     amount: Decimal
+    details: str
+
+class NullTransaction(NamedTuple):
+    received: None
+    date: None
+    amount: None
     details: str
 
 def extract_dates(text: str) -> tuple[list[str], int | None, int | None]:
@@ -61,7 +69,6 @@ def parse_date(date_str: str) -> datetime:
     except ValueError:
         raise ValueError(f"Unable to parse date: {date_str}")
 
-
 def parse_transaction_amounts(text: str) -> list[Decimal]:
     """
     Parse all transaction amounts from the text, expecting numbers with 2 decimal places,
@@ -99,12 +106,14 @@ def yield_credit_infos(fname: str):
         a transaction, returns None otherwise."""
         re_dates, first_char_ix, last_char_ix = extract_dates(line)
         if len(re_dates) == 0:
+            yield NullTransaction(
+                received=None,
+                date=None,
+                amount=None,
+                details=line,
+            )
             return
-        try:
-            assert len(re_dates) == 2, f'Wrong number of dates: {re_dates}'
-        except AssertionError:
-            extract_dates(line)
-            raise AssertionError
+        assert len(re_dates) == 2, f'Wrong number of dates: {re_dates}'
         assert first_char_ix == 0, f'Unexpected received date placement on line: {line}'
         rdate, ddate = [parse_date(dt_str) for dt_str in re_dates]
 
@@ -131,15 +140,25 @@ def yield_credit_infos(fname: str):
         for t in try_transaction(line):
             yield t
 
-
 def get_credit_infos(fname: str) -> List[Transaction]:
     return list(yield_credit_infos(fname))
 
 
-def main(pdf_folder_path: str | Path):
+def make_dataframe_from_path(pdf_folder_path: str | Path):
     res = sorted(Path(pdf_folder_path).glob('*.pdf'))
     assert len(res) > 0
+    data = []
     for pdf_path in res:
-        infos = get_credit_infos(pdf_path)
-        for info in infos:
-            print(info)
+        print(pdf_path)
+        sdate = datetime.strptime(pdf_path.name[:10], "%Y-%m-%d").date()
+        transactions = get_credit_infos(pdf_path)
+        for t in transactions:
+            data.append({
+                'statement_fpath': pdf_path,
+                'statement_date': sdate,
+                'received_date': t.received,
+                'transaction_date': t.date,
+                'amount': t.amount,
+                'details': t.details
+            })
+    return pd.DataFrame(data)
