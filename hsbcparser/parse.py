@@ -71,25 +71,27 @@ def parse_date(date_str: str) -> datetime:
 
 def parse_transaction_amounts(text: str) -> list[Decimal]:
     """
-    Parse all transaction amounts from the text, expecting numbers with 2 decimal places,
-    possibly with commas and optional CR/DR suffix, and potentially enclosed in quotes.
+    Parse all transaction amounts from the text, expecting numbers with 2 decimal places
+    at the end of each line, optionally with commas in the number, optionally followed by
+    CR or DR suffix, a double quote, and/or a comma.
     Returns a list of Decimal amounts.
     """
-    # Match numbers with 2 decimal places, optional commas, optional CR/DR suffix, and optional quotes
-    pattern = r'"?(\d{1,3}(?:,\d{3})*\.\d{2}(?:CR|DR)?)"?'
-    matches = re.findall(pattern, text)
+    # Match a number with optional commas and 2 decimal places, preceded by comma, space, or quote
+    pattern = r'(?:,|\s|\")(\d{1,3}(?:,\d{3})*\.\d{2})(?:CR|DR)?\"?,?$'
+    matches = re.findall(pattern, text, re.MULTILINE)
 
     if not matches:
         raise ValueError(f"No amounts with 2 decimal places found in text: {text}")
 
-    # Clean and convert matches to Decimal
+    # Convert matches to Decimal
     amounts = []
     for match in matches:
-        cleaned_amount = match.replace(',', '').rstrip('CR').rstrip('DR')
+        cleaned_amount = match.replace(',', '')
         amount = Decimal(cleaned_amount).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         amounts.append(amount)
 
     return amounts
+
 
 def yield_credit_infos(fname: str):
     CMD = [
@@ -122,10 +124,13 @@ def yield_credit_infos(fname: str):
         amounts = parse_transaction_amounts(remaining_line)
         assert len(amounts) == 1, f'Unexpected number of amounts on line {line}'
         amount = amounts[0]
+        if amount > 19000:
+            print('big amount', line)
 
-        # Extract details: remove dates and full amount string (including CR/DR if present), then strip
-        str_amount = str(amount)
+        str_amount = '{:,}'.format(amount)
         amount_start, amount_end = remaining_line.find(str_amount), remaining_line.find(str_amount) + len(str_amount)
+        if remaining_line[amount_start - 1] not in [str(n) for n in range(10)] + [' ', ',', '"']:
+            print('letter before number:', line)
         details = remaining_line[:amount_start] + remaining_line[amount_end:]
         details = details.replace(',', ' ').strip()
 
@@ -161,4 +166,4 @@ def make_dataframe_from_path(pdf_folder_path: str | Path):
                 'amount': t.amount,
                 'details': t.details
             })
-    return pd.DataFrame(data)
+    return pd.DataFrame(data).astype({'amount': float})
