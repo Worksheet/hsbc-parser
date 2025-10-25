@@ -1,30 +1,4 @@
-from decimal import Decimal, ROUND_HALF_UP
-import re
-
-
-def parse_transaction_amounts(text: str) -> list[Decimal]:
-    """
-    Parse all transaction amounts from the text, expecting numbers with 2 decimal places
-    at the end of each line, optionally with commas in the number, optionally followed by
-    CR or DR suffix, a double quote, and/or a comma.
-    Returns a list of Decimal amounts.
-    """
-    # Match a number with optional commas and 2 decimal places, preceded by comma, space, or quote
-    pattern = r'(?:,|\s|\")(\d{1,3}(?:,\d{3})*\.\d{2})(?:CR|DR)?\"?,?$'
-    matches = re.findall(pattern, text, re.MULTILINE)
-
-    if not matches:
-        raise ValueError(f"No amounts with 2 decimal places found in text: {text}")
-
-    # Convert matches to Decimal
-    amounts = []
-    for match in matches:
-        cleaned_amount = match.replace(',', '')
-        amount = Decimal(cleaned_amount).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        amounts.append(amount)
-
-    return amounts
-
+from hsbcparser import parse_transaction_amounts
 
 # Test cases
 test_cases = [
