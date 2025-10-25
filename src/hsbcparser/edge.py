@@ -1,4 +1,4 @@
-from hsbcparser import parse_transaction_amounts
+from hsbcparser.parse import parse_transaction_amounts
 
 # Test cases
 test_cases = [
