@@ -11,17 +11,20 @@ import pandas as pd
 
 TABULA_PATH = os.environ['TABULA_JAR_PATH']
 
+
 class Transaction(NamedTuple):
     received: date
     date: date
     amount: Decimal
     details: str
 
+
 class NullTransaction(NamedTuple):
     received: None
     date: None
     amount: None
     details: str
+
 
 def extract_dates(text: str) -> tuple[list[str], int | None, int | None]:
     """
@@ -33,7 +36,8 @@ def extract_dates(text: str) -> tuple[list[str], int | None, int | None]:
     # Sometimes there is a comma inside the date, ideally this would be handled somewhere more obvious.
     text_normalised = text.replace(',', ' ').replace('"', '')
     pattern = r"\b\d{1,2} [A-Za-z]{3} \d{2}\b"
-    potential_matches = [(match.group(), match.start(), match.end() - 1) for match in re.finditer(pattern, text_normalised)]
+    potential_matches = [(match.group(), match.start(), match.end() - 1) for match in
+                         re.finditer(pattern, text_normalised)]
 
     # Valid month abbreviations
     valid_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -68,6 +72,7 @@ def parse_date(date_str: str) -> datetime:
         return datetime.strptime(date_str, "%d %b %y")
     except ValueError:
         raise ValueError(f"Unable to parse date: {date_str}")
+
 
 def parse_transaction_amounts(text: str) -> list[Decimal]:
     """
@@ -119,7 +124,6 @@ def yield_credit_infos(fname: str):
         assert first_char_ix == 0, f'Unexpected received date placement on line: {line}'
         rdate, ddate = [parse_date(dt_str) for dt_str in re_dates]
 
-
         remaining_line = line[last_char_ix + 1:]
         amounts = parse_transaction_amounts(remaining_line)
         assert len(amounts) == 1, f'Unexpected number of amounts on line {line}'
@@ -144,6 +148,7 @@ def yield_credit_infos(fname: str):
     for line in res.splitlines():
         for t in try_transaction(line):
             yield t
+
 
 def get_credit_infos(fname: str) -> List[Transaction]:
     return list(yield_credit_infos(fname))

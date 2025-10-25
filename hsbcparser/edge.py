@@ -1,6 +1,7 @@
 from decimal import Decimal, ROUND_HALF_UP
 import re
 
+
 def parse_transaction_amounts(text: str) -> list[Decimal]:
     """
     Parse all transaction amounts from the text, expecting numbers with 2 decimal places
@@ -23,6 +24,7 @@ def parse_transaction_amounts(text: str) -> list[Decimal]:
         amounts.append(amount)
 
     return amounts
+
 
 # Test cases
 test_cases = [
