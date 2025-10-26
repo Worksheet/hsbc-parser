@@ -2,173 +2,199 @@
 import os
 import re
 from pathlib import Path
-from typing import NamedTuple, List
+from typing import NamedTuple, List, Iterator, Optional, Literal
 from datetime import date, datetime
-from subprocess import check_output
+from subprocess import check_output, CalledProcessError
 from decimal import Decimal, ROUND_HALF_UP
 
 import pandas as pd
 
-TABULA_PATH = os.environ['TABULA_JAR_PATH']
+# --- Configuration ---
+TABULA_PATH = os.environ.get("TABULA_JAR_PATH")
+if not TABULA_PATH:
+    raise EnvironmentError(
+        "Environment variable TABULA_JAR_PATH is not set. "
+        "Please set it to the path of the Tabula JAR file."
+    )
 
 
+# --- Data Models ---
 class Transaction(NamedTuple):
     received: date
     date: date
     amount: Decimal
+    crdr: Literal["CR", "DR", "Payment"]
+    is_contactless: bool
     details: str
 
 
 class NullTransaction(NamedTuple):
-    received: None
-    date: None
-    amount: None
+    received: Optional[date]
+    date: Optional[date]
+    amount: Optional[Decimal]
+    crdr: Optional[str]
+    is_contactless: Optional[bool]
     details: str
 
 
-def extract_dates(text: str) -> tuple[list[str], int | None, int | None]:
+# --- Core Parsing Functions ---
+def extract_dates(text: str) -> tuple[list[str], Optional[int], Optional[int]]:
     """
-    Extract date strings in 'DD Mon YY' format from the text, allowing for optional comma
-    between month and year (e.g., '14 Aug 23' or '14 Aug,23').
-    Only accepts standard English month abbreviations (Jan, Feb, Mar, etc.).
-    Returns a tuple of (date_strings, first_index, last_index).
+    Extract date strings in 'DD Mon YY' format from the text, allowing commas.
+    Returns (list of date strings, first index, last index).
     """
-    # Sometimes there is a comma inside the date, ideally this would be handled somewhere more obvious.
-    text_normalised = text.replace(',', ' ').replace('"', '')
+    text_normalised = text.replace(",", " ").replace('"', "")
     pattern = r"\b\d{1,2} [A-Za-z]{3} \d{2}\b"
-    potential_matches = [(match.group(), match.start(), match.end() - 1) for match in
-                         re.finditer(pattern, text_normalised)]
+    potential_matches = [(m.group(), m.start(), m.end() - 1)
+                         for m in re.finditer(pattern, text_normalised)]
 
-    # Valid month abbreviations
-    valid_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    valid_months = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 
-    # Filter matches to ensure month is valid
-    valid_matches = []
-    for match_text, start, end in potential_matches:
-        # Extract just the month portion (should be the second word)
-        parts = match_text.split()
-        if len(parts) >= 2:
-            month_part = parts[1].rstrip(',')
-            if month_part in valid_months or month_part.capitalize() in valid_months:
-                valid_matches.append((match_text, start, end))
+    valid_matches = [
+        (txt, start, end)
+        for txt, start, end in potential_matches
+        if txt.split()[1].rstrip(",").capitalize() in valid_months
+    ]
 
-    date_strs = [match[0] for match in valid_matches]
-    if valid_matches:
-        first_ix = valid_matches[0][1]  # Start index of first valid date
-        last_ix = valid_matches[-1][2]  # End index of last valid date
-    else:
-        first_ix = last_ix = None
+    if not valid_matches:
+        return [], None, None
 
-    return date_strs, first_ix, last_ix
+    date_strs = [m[0] for m in valid_matches]
+    return date_strs, valid_matches[0][1], valid_matches[-1][2]
 
 
 def parse_date(date_str: str) -> datetime:
-    """
-    Parse a date string in 'dd mmm yy' format into a datetime object.
-    Raises ValueError if parsing fails.
-    """
+    """Parse 'dd mmm yy' into datetime."""
     try:
         return datetime.strptime(date_str, "%d %b %y")
-    except ValueError:
-        raise ValueError(f"Unable to parse date: {date_str}")
+    except ValueError as e:
+        raise ValueError(f"Unable to parse date '{date_str}': {e}") from e
 
 
-def parse_transaction_amounts(text: str) -> list[Decimal]:
+def parse_transaction_amounts(text: str) -> list[tuple[Decimal, str]]:
     """
-    Parse all transaction amounts from the text, expecting numbers with 2 decimal places
-    at the end of each line, optionally with commas in the number, optionally followed by
-    CR or DR suffix, a double quote, and/or a comma.
-    Returns a list of Decimal amounts.
+    Extract transaction amounts and CR/DR suffix if present.
+    Returns list of (amount, crdr) tuples.
     """
-    # Match a number with optional commas and 2 decimal places, preceded by comma, space, or quote
-    pattern = r'(?:,|\s|\")(\d{1,3}(?:,\d{3})*\.\d{2})(?:CR|DR)?\"?,?$'
+    pattern = r'(?:,|\s|\")(\d{1,3}(?:,\d{3})*\.\d{2})(CR|DR)?\"?,?$'
     matches = re.findall(pattern, text, re.MULTILINE)
 
     if not matches:
         raise ValueError(f"No amounts with 2 decimal places found in text: {text}")
 
-    # Convert matches to Decimal
-    amounts = []
-    for match in matches:
-        cleaned_amount = match.replace(',', '')
-        amount = Decimal(cleaned_amount).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        amounts.append(amount)
+    results = []
+    for num_str, suffix in matches:
+        cleaned = num_str.replace(",", "")
+        amount = Decimal(cleaned).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        crdr = suffix or "Payment"
+        results.append((amount, crdr))
+    return results
 
-    return amounts
+
+def try_transaction(line: str) -> Iterator[Transaction | NullTransaction]:
+    """
+    Try to parse a line into Transaction(s). Returns a generator.
+    Yields either Transaction or NullTransaction.
+    """
+    re_dates, first_ix, last_ix = extract_dates(line)
+    if not re_dates:
+        yield NullTransaction(None, None, None, None, None, line)
+        return
+
+    if len(re_dates) != 2:
+        raise ValueError(f"Expected 2 dates, found {len(re_dates)}: {re_dates}")
+
+    if first_ix != 0:
+        raise ValueError(f"Unexpected received-date placement: {line}")
+
+    rdate, ddate = [parse_date(d) for d in re_dates]
+
+    remaining_line = line[last_ix + 1:]
+    amounts = parse_transaction_amounts(remaining_line)
+    if len(amounts) != 1:
+        raise ValueError(f"Expected 1 amount, found {len(amounts)}: {line}")
+
+    amount, crdr = amounts[0]
+
+    if crdr not in ['CR', 'DR', 'Payment']:
+        raise ValueError(f'Unrecognised payment type string: {crdr}')
+
+    # Integrity check: amounts shouldn't be absurd
+    if amount > Decimal("100000.00"):
+        raise ValueError(f"Unusually large amount: {amount} in line: {line}")
+
+    str_amount = f"{amount:,}"
+    amount_start = remaining_line.find(str_amount)
+    if amount_start == -1:
+        raise ValueError(f"Could not locate amount text in line: {line}")
+
+    amount_end = amount_start + len(str_amount)
+    details = (remaining_line[:amount_start] + remaining_line[amount_end:]).replace(",", " ").strip()
+
+    is_contactless = details.startswith(")))")
+
+    yield Transaction(
+        received=rdate.date(),
+        date=ddate.date(),
+        amount=amount,
+        crdr=crdr,
+        is_contactless=is_contactless,
+        details=details,
+    )
 
 
-def yield_credit_infos(fname: str):
-    CMD = [
-        'java',
-        '-jar', TABULA_PATH,
-        '--pages', 'all',
-        '--silent',
-        fname,
+# --- I/O and orchestration ---
+def yield_credit_infos(fname: str | Path) -> Iterator[Transaction | NullTransaction]:
+    """
+    Run Tabula on a PDF and yield parsed transactions.
+    """
+    cmd = [
+        "java",
+        "-jar", TABULA_PATH,
+        "--pages", "all",
+        "--silent",
+        str(fname),
     ]
-    res = check_output(CMD).decode('windows-1252')
 
-    def try_transaction(line: str):
-        """Given a line from a credit card statement, create a Transaction where the line can be parsed as
-        a transaction, returns None otherwise."""
-        re_dates, first_char_ix, last_char_ix = extract_dates(line)
-        if len(re_dates) == 0:
-            yield NullTransaction(
-                received=None,
-                date=None,
-                amount=None,
-                details=line,
-            )
-            return
-        assert len(re_dates) == 2, f'Wrong number of dates: {re_dates}'
-        assert first_char_ix == 0, f'Unexpected received date placement on line: {line}'
-        rdate, ddate = [parse_date(dt_str) for dt_str in re_dates]
-
-        remaining_line = line[last_char_ix + 1:]
-        amounts = parse_transaction_amounts(remaining_line)
-        assert len(amounts) == 1, f'Unexpected number of amounts on line {line}'
-        amount = amounts[0]
-        if amount > 19000:
-            print('big amount', line)
-
-        str_amount = '{:,}'.format(amount)
-        amount_start, amount_end = remaining_line.find(str_amount), remaining_line.find(str_amount) + len(str_amount)
-        if remaining_line[amount_start - 1] not in [str(n) for n in range(10)] + [' ', ',', '"']:
-            print('letter before number:', line)
-        details = remaining_line[:amount_start] + remaining_line[amount_end:]
-        details = details.replace(',', ' ').strip()
-
-        yield Transaction(
-            received=rdate.date(),
-            date=ddate.date(),
-            amount=amount,
-            details=details,
-        )
+    try:
+        res = check_output(cmd).decode("windows-1252")
+    except FileNotFoundError as e:
+        raise RuntimeError("Java not found or TABULA_JAR_PATH invalid") from e
+    except CalledProcessError as e:
+        raise RuntimeError(f"Tabula command failed: {e}") from e
 
     for line in res.splitlines():
-        for t in try_transaction(line):
-            yield t
+        yield from try_transaction(line)
 
 
-def get_credit_infos(fname: str) -> List[Transaction]:
+def get_credit_infos(fname: str | Path) -> List[Transaction | NullTransaction]:
+    """Convenience wrapper to return all transactions from a single file."""
     return list(yield_credit_infos(fname))
 
 
-def make_dataframe_from_path(pdf_folder_path: str | Path):
-    res = sorted(Path(pdf_folder_path).glob('*.pdf'))
-    assert len(res) > 0
-    data = []
-    for pdf_path in res:
-        print(pdf_path)
+def make_dataframe_from_path(pdf_folder_path: str | Path) -> pd.DataFrame:
+    """
+    Build a dataframe of transactions from all PDFs in a folder.
+    """
+    pdf_folder = Path(pdf_folder_path)
+    pdfs = sorted(pdf_folder.glob("*.pdf"))
+    if not pdfs:
+        raise FileNotFoundError(f"No PDF files found in {pdf_folder}")
+
+    rows = []
+    for pdf_path in pdfs:
         sdate = datetime.strptime(pdf_path.name[:10], "%Y-%m-%d").date()
-        transactions = get_credit_infos(pdf_path)
-        for t in transactions:
-            data.append({
-                'statement_fpath': pdf_path,
-                'statement_date': sdate,
-                'received_date': t.received,
-                'transaction_date': t.date,
-                'amount': t.amount,
-                'details': t.details
+        for t in get_credit_infos(pdf_path):
+            rows.append({
+                "statement_fpath": pdf_path,
+                "statement_date": sdate,
+                "received_date": t.received,
+                "transaction_date": t.date,
+                "amount": float(t.amount) if t.amount is not None else None,
+                "crdr": t.crdr,
+                "is_contactless": t.is_contactless,
+                "details": t.details,
             })
-    return pd.DataFrame(data).astype({'amount': float})
+
+    return pd.DataFrame(rows)
